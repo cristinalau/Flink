@@ -1,0 +1,401 @@
+FLINK SOURCE DATABASE ACCESS - CGS EXAMPLE
+==========================================
+
+Purpose
+-------
+This is a step-by-step source database checklist for the Flink app cgs.
+It shows two ways to keep the Flink login's table access and publication
+membership in sync:
+
+OPTION 1: a DBA performs each source database change.
+OPTION 2: a DBA installs restricted functions and the Flink login calls them.
+
+CGS names used in this example
+------------------------------
+Flink app:                   cgs
+Source database:             <cgs_database>
+Example source table:        cgs.dgswagers
+Example Flink database role: cgs_flink
+Example publication:         cgs_publication
+Example replication slot:    cgs
+Self-service owner role:     cgs_pub_owner
+Self-service control schema: flink_ops
+
+The same steps apply to ILP: replace the app-specific `cgs` name
+component with `ilp` and use ILP's actual database, schema, and table names.
+See the note at the end of this document.
+
+The CGS database and schema are not yet known, so they are placeholders here.
+Confirm the actual database, schema, writer endpoint, and table scope with the
+source DBA before executing anything. The role, publication, slot, and function
+owner names are examples; check that they are available and approved.
+
+IMPORTANT CONNECTION NOTE
+-------------------------
+Logical replication must connect through the Aurora writer/cluster endpoint.
+Do not assume a reader endpoint is suitable for logical replication. Ask the
+source AWS administrator for the current writer/cluster endpoint and confirm
+network reachability from Flink.
+
+PostgreSQL roles are cluster-wide, not database-local. The login
+cgs_flink can be granted access to more than one database on the same
+cluster, but database CONNECT, schema USAGE, table SELECT, publications, and
+replication slots must be configured separately in each database. Do not
+create a second role with the same name for another database.
+
+These steps assume password-based database authentication. For IAM database
+authentication, check additional documentation (will be provided later). The current
+Flink job's static startup password handling is not by itself a complete
+IAM-token refresh implementation.
+
+
+
+OPTION 1 (DEPENDENCY TO DBA)
+============================
+
+Use this option when the Flink login should not be allowed to change
+publication membership or grant itself table access. A DBA/source table owner
+performs each table onboarding/removal.
+
+Initial setup - one time per Aurora cluster/database
+----------------------------------------------------
+
+1. Confirm the target
+
+   Ask the source DBA to confirm:
+   - The Aurora PostgreSQL cluster and writer/cluster endpoint.
+   - The exact database is <cgs_database>.
+   - The example table cgs.dgswagers exists and is in scope.
+   - The table has a primary key and is supported by the Flink pipeline.
+   - The cluster has logical replication enabled as required by the deployment.
+   - No other application already uses the proposed role, publication, or slot
+     names.
+
+2. Create the Flink login
+
+   Connect as the authorized DBA to <cgs_database> on the Aurora writer:
+
+       CREATE ROLE cgs_flink LOGIN;
+
+   Set its password interactively in psql:
+
+       \password cgs_flink
+
+   Store the password only in the approved secret store used by this Flink
+   application. Do not put it in this document, source control, or command
+   history. Do not use the DBA login in Flink.
+
+3. Grant the minimum database and replication permissions
+
+   While connected to <cgs_database>:
+
+       GRANT rds_replication TO cgs_flink;
+       GRANT CONNECT ON DATABASE "<cgs_database>" TO cgs_flink;
+       GRANT USAGE ON SCHEMA <schema> TO cgs_flink;
+       GRANT SELECT ON TABLE <schema>.dgswagers TO cgs_flink;
+
+   Do not grant the Flink login rds_superuser, table ownership, write
+   permissions, or WITH GRANT OPTION.
+
+4. Create or update the publication
+
+   First check whether cgs_publication already exists and verify its
+   membership. If it does not exist, create it as the source table owner or
+   authorized DBA:
+
+       CREATE PUBLICATION cgs_publication
+       FOR TABLE <schema>.dgswagers;
+
+   If it already exists and is the intended app publication, add the table
+   only if it is not already included:
+
+       ALTER PUBLICATION cgs_publication
+       ADD TABLE <schema>.dgswagers;
+
+   Do not create a duplicate publication or use a broad FOR ALL TABLES
+   publication without explicit approval.
+
+5. Verify the grant and publication
+
+   Run in <cgs_database>:
+
+       SELECT has_database_privilege(
+         'cgs_flink', '<cgs_database>', 'CONNECT'
+       ) AS can_connect;
+
+       SELECT has_schema_privilege(
+         'cgs_flink', '<schema>', 'USAGE'
+       ) AS schema_usage;
+
+       SELECT has_table_privilege(
+         'cgs_flink', '<schema>.dgswagers', 'SELECT'
+       ) AS table_select;
+
+       SELECT pubname, schemaname, tablename
+       FROM pg_publication_tables
+       WHERE pubname = 'cgs_publication'
+       ORDER BY schemaname, tablename;
+
+   Confirm the privilege checks are true and the table is listed before
+   starting the Flink source.
+
+6. Configure and start the Flink source
+
+   In the cgs app configuration, set the source database to
+   <cgs_database> and include the source table as <schema>.dgswagers.
+   Set the source publication to cgs_publication. Use a unique logical
+   replication slot name for this app/database; this example uses cgs.
+
+   Flink CDC normally creates the slot when it starts. Do not create the slot
+   long before startup. A stopped slot can retain WAL on Aurora. Follow the
+   deployment runbook to upload the pipeline, set the full runtime source
+   table list, and start the application.
+
+Onboard another table
+---------------------
+
+7. Stop the Flink app and wait for its application status to become READY.
+
+8. For an example new table <schema>.<new_table>, the DBA verifies it exists,
+   has a primary key, and is approved for replication. Then the DBA runs:
+
+       GRANT USAGE ON SCHEMA <schema> TO cgs_flink;
+       GRANT SELECT ON TABLE <schema>.<new_table> TO cgs_flink;
+       ALTER PUBLICATION cgs_publication
+       ADD TABLE <schema>.<new_table>;
+
+   Substitute the real unquoted table identifier. Quote identifiers if they
+   contain uppercase characters or special characters.
+
+9. Verify SELECT privilege and publication membership for the new table.
+   Tell the Flink operator the DBA change is complete.
+
+10. The operator adds <schema>.<new_table> to the cgs app table list,
+    regenerates and reviews the pipeline, uploads it, updates the complete
+    runtime source.tables list, and restarts the app using the documented
+    procedure. A fresh snapshot may read all configured tables, not only the
+    new table.
+
+Remove a table
+--------------
+
+11. Stop the Flink app and wait for READY. The operator removes the table
+    from the pipeline configuration and runtime source.tables list.
+
+12. The DBA removes only the table's publication membership and Flink SELECT
+    grant:
+
+       ALTER PUBLICATION cgs_publication
+       DROP TABLE <schema>.<table_to_remove>;
+       REVOKE SELECT ON TABLE <schema>.<table_to_remove> FROM cgs_flink;
+
+    Do not drop the source table or replication slot as part of this action.
+    Removing a table from replication does not delete already-written
+    destination data; handle its retention separately.
+
+
+---------
+
+
+OPTION 2 (SELF SERVICE)
+=======================
+
+Use this option only if the DBA approves the ownership model and restricted
+SECURITY DEFINER functions. The DBA still performs initial setup and installs
+the functions. After that, cgs_flink can call a fixed add/remove function
+instead of receiving direct publication ownership.
+
+IMPORTANT LIMITATIONS
+---------------------
+- This option is more complex and has more risk than Option 1.
+- The dedicated function owner must own the fixed publication and every table
+  the functions manage. If source tables have different owners, stop and use
+  Option 1 unless the DBA designs and reviews a suitable alternative.
+- The function must have a fixed publication and approved-schema allowlist.
+  Do not accept caller-supplied role names, publication names, or arbitrary
+  SQL.
+- The function owner must not be rds_superuser, and the Flink login must not
+  be granted membership in the function-owner role.
+- The add function grants schema USAGE and table SELECT, then adds the table
+  to the publication. It does not configure Flink pipeline YAML or runtime
+  properties.
+- Do not create a function that lets the Flink user drop arbitrary
+  replication slots. Slot cleanup remains an operator/DBA action.
+
+DBA installation - one time in each source database
+---------------------------------------------------
+
+1. Confirm the target table and ownership
+
+   Connect as the authorized DBA to <cgs_database> on the Aurora writer.
+   Confirm <schema>.dgswagers exists, has a primary key, and is approved.
+   Check its owner. Proceed only if the dedicated function-owner role can own
+   the table without disrupting the source system. The function in the
+   self-service guide deliberately rejects tables with another owner.
+
+2. Create the runtime login if it does not already exist
+
+   If Option 1 was used for initial provisioning, keep the same login:
+
+       cgs_flink
+
+   Otherwise create it as in Option 1, set its password, and store it only in
+   the approved Flink secret store. A PostgreSQL login is cluster-wide; do
+   not create it again separately for another database on this cluster.
+
+3. Create the dedicated non-login owner role
+
+       CREATE ROLE cgs_pub_owner NOLOGIN;
+
+   Do not grant this role to cgs_flink. The DBA may grant it temporarily
+   to an authorized installer account if required to install and own the
+   functions.
+
+4. Grant baseline runtime privileges
+
+   In <cgs_database>:
+
+       GRANT rds_replication TO cgs_flink;
+       GRANT CONNECT ON DATABASE "<cgs_database>" TO cgs_flink;
+       GRANT USAGE ON SCHEMA flink_ops TO cgs_flink;
+
+   The last grant is applied after flink_ops is created by the installation
+   script. Do not grant direct publication/table ownership to cgs_flink.
+
+5. Assign approved table/publication ownership to cgs_pub_owner
+
+   Follow the ownership and publication setup steps in
+   FLINK_SOURCE_DB_model2.docx. That guide includes the
+   statements for:
+   - temporarily granting/revoking schema CREATE during an approved table
+     ownership transfer;
+   - assigning <schema>.dgswagers to cgs_pub_owner;
+   - creating or transferring the fixed table-list publication
+     cgs_publication to cgs_pub_owner;
+   - creating the protected flink_ops schema and approved-schema allowlist.
+
+   Do not transfer ownership without explicit approval from the source table
+   owner. Do not proceed if the publication is FOR ALL TABLES, has
+   unapproved membership, or the expected ownership checks fail.
+
+6. Install the two restricted functions
+
+   Use the complete function definitions from the DBA installation sections
+   "Install the add-and-grant function" and "Install the remove-and-revoke
+   function" in FLINK_SOURCE_DB_model2.docx. Before running
+   them, replace the fixed placeholders consistently:
+
+       <database>      -> <cgs_database>
+       <flink_login>   -> cgs_flink
+       <publication>   -> cgs_publication
+       <owner_role>    -> cgs_pub_owner
+       <schema_a>      -> <schema>
+
+   Ensure the installed add function validates that the table is in the
+   approved schema, is an ordinary or partitioned table, has a primary key,
+   is owned by cgs_pub_owner, and is being added to the fixed publication.
+   Ensure only cgs_flink receives EXECUTE on the fixed add/remove
+   signatures; PUBLIC must not have EXECUTE.
+
+7. Verify function and permission boundaries as DBA
+
+   Follow the verification queries in FLINK_SOURCE_DB_model2.docx.
+   Confirm:
+   - cgs_publication is a table-list publication owned by
+     cgs_pub_owner;
+   - <schema> is the only approved schema unless the DBA explicitly approved
+     more;
+   - <schema>.dgswagers is owned by cgs_pub_owner and has a primary key;
+   - only cgs_flink is granted EXECUTE on the functions;
+   - cgs_flink is not a member of cgs_pub_owner and cannot alter the
+     publication directly.
+
+Runtime table onboarding by the Flink login
+-------------------------------------------
+
+8. Stop the cgs Flink app and wait for READY before changing the source
+   publication or pipeline table set.
+
+9. Connect as cgs_flink to database <cgs_database> and request the
+   example table:
+
+       SELECT flink_ops.add_source_table('<schema>', 'dgswagers');
+
+   For another approved table, substitute its exact schema and table names:
+
+       SELECT flink_ops.add_source_table('<schema>', '<new_table>');
+
+   The function grants schema USAGE and table SELECT to cgs_flink and adds
+   the table to cgs_publication if it is not already published. It raises
+   an error for an unapproved schema, missing/ineligible table, missing
+   primary key, wrong owner, or wrong publication ownership.
+
+10. Verify the resulting grant and publication membership:
+
+       SELECT has_schema_privilege(
+         'cgs_flink', '<schema>', 'USAGE'
+       ) AS schema_usage;
+
+       SELECT has_table_privilege(
+         'cgs_flink', '<schema>.dgswagers', 'SELECT'
+       ) AS table_select;
+
+       SELECT pubname, schemaname, tablename
+       FROM pg_publication_tables
+       WHERE pubname = 'cgs_publication'
+       ORDER BY schemaname, tablename;
+
+11. The Flink operator then adds <schema>.dgswagers to the app's complete
+    configured table list, regenerates and reviews pipeline.yaml, uploads
+    it, updates runtime source.tables, and restarts the job. The function
+    changes source database access only; it does not change Flink settings.
+
+Runtime table removal by the Flink login
+----------------------------------------
+
+12. Stop the app and wait for READY. Connect as cgs_flink to
+    <cgs_database> and run:
+
+       SELECT flink_ops.remove_source_table('<schema>', '<table_to_remove>');
+
+    This removes publication membership if present and revokes SELECT on
+    that table. It does not drop the source table, destination data, or
+    replication slot.
+
+13. Update and review the Flink table list/YAML/runtime source.tables, then
+    restart following the operational runbook. Agree separately whether
+    already-replicated destination data should be retained or removed.
+
+Second database on the same Aurora cluster
+------------------------------------------
+
+14. Install/verify the functions, publication, allowlist, and database/table
+    grants separately in the second database. PostgreSQL functions,
+    publications, CONNECT grants, schema/table grants, and logical slots are
+    database-scoped, but the cgs_flink and cgs_pub_owner roles are
+    cluster-wide. Use a separate publication and slot name for the second
+    Flink source. One PostgreSQL CDC source must connect to one database.
+
+
+REPOSITORY CONTEXT AND NAME CHECK
+=================================
+
+This document's primary example is CGS:
+  Flink app:        cgs
+  Source database: <cgs_database> (replace with the actual database name)
+  Source table:    <schema>.dgswagers (replace <schema> with its actual schema)
+  Flink login:     cgs_flink
+  Publication:     cgs_publication
+  Slot:            cgs
+  Function owner:  cgs_pub_owner
+
+The same steps apply to ILP. Replace the app-specific `cgs` name component
+with `ilp` (for example, `ilp_flink`, `ilp_publication`, `ilp_pub_owner`,
+and slot `ilp`) and use ILP's actual database, schema, and tables. The
+repository's current ILP development sample lists database
+`ilp-ks-ilp-staging` and table `bonus.bnsbonusobjects`, but is marked
+Glue-only; verify with the source DBA before using these values for Flink.
+
+The names above are examples, not proof that the roles, publication, or slot
+already exist. Check pg_roles, pg_publication, and pg_replication_slots
+with the DBA before creating them.
